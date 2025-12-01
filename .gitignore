@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Virtual Environment
+venv/
+ENV/
+.venv/
+
+# Chroma / Vector DB
+chroma_db/
+
+# Environment variables & Secrets
+.env
+*.key
+*.token
+
+# Cache & Misc
+*.sqlite
+*.db
+*.log
