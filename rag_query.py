@@ -1,174 +1,165 @@
-
+# rag_query.py
 import os
-import json
-import textwrap
-import requests
 from dotenv import load_dotenv
-
-from langchain_huggingface import HuggingFaceEmbeddings
-from langchain_community.vectorstores import Chroma
-
 load_dotenv()
 
+from typing import Dict
 
-CHROMA_DIR = "chroma_db"
-HF_EMBED_MODEL = "sentence-transformers/all-MiniLM-L6-v2"  # same as ingestion
-TOP_K = 5
+# -------------------------
+# LangChain imports
+# -------------------------
+from langchain_core.chat_history import InMemoryChatMessageHistory
+from langchain_core.runnables.history import RunnableWithMessageHistory
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.runnables import RunnableLambda, RunnableMap
+from langchain_core.output_parsers import StrOutputParser
 
-GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
-GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
+from langchain_groq import ChatGroq
 
+
+# -------------------------
+# Environment + Config
+# -------------------------
 GROQ_MODEL = "llama-3.1-8b-instant"
-
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 
 if not GROQ_API_KEY:
-    raise RuntimeError("GROQ_API_KEY not found in environment. Set it in your .env")
+    raise RuntimeError("Missing GROQ_API_KEY in environment!")
 
 
-embeddings = HuggingFaceEmbeddings(model_name=HF_EMBED_MODEL)
+# -------------------------
+# LLM (Groq via LangChain)
+# -------------------------
+llm = ChatGroq(
+    api_key=GROQ_API_KEY,
+    model=GROQ_MODEL,
+    temperature=0.0
+)
 
 
-db = Chroma(persist_directory=CHROMA_DIR, embedding_function=embeddings)
+# -------------------------
+# Prompt templates
+# -------------------------
+REWRITE_SYSTEM = """
+You are a question rewriter. Based on the conversation history and the latest user query,
+rewrite the user query into a standalone question suitable for document retrieval.
+"""
 
-retriever = db.as_retriever(search_kwargs={"k": TOP_K})
+rewrite_prompt = ChatPromptTemplate.from_messages([
+    ("system", REWRITE_SYSTEM),
+    ("human", "{input}")
+])
+
+QA_SYSTEM = """
+You are a compliance assistant.
+Use ONLY the retrieved document chunks to answer.
+If the answer is not present, reply: "I don't know; please consult the policy team."
+Keep answers concise and factual.
+"""
+
+qa_prompt = ChatPromptTemplate.from_messages([
+    ("system", QA_SYSTEM),
+    ("human", "Question: {question}\n\nContext:\n{context}")
+])
 
 
-def build_context(docs):
-    """
-    docs: list of Document objects with .page_content and .metadata (langchain docs)
-    Returns concatenated context string and a list of sources
-    """
-    pieces = []
-    sources = []
+# -------------------------
+# Utility: format documents
+# -------------------------
+def format_docs(docs):
+    out = []
     for i, d in enumerate(docs, start=1):
-        content = d.page_content.strip()
-        meta = d.metadata or {}
-        # include a short metadata string if available
-        meta_str = ", ".join(f"{k}={v}" for k, v in meta.items()) if meta else ""
-        piece = f"--- CHUNK {i} | {meta_str}\n{content}\n"
-        pieces.append(piece)
-        # sources: try to include filename / page info from metadata
-        src = meta.get("source") or meta.get("filename") or meta.get("source_id") or f"chunk_{i}"
-        sources.append(src)
-    context = "\n\n".join(pieces)
-    return context, sources
+        src = d.metadata.get("source", "unknown")
+        page = d.metadata.get("page", "?")
+        out.append(f"[CHUNK {i} | {src} | page {page}]\n{d.page_content}")
+    return "\n\n".join(out)
 
 
-SYSTEM_PROMPT = textwrap.dedent("""
-You are a compliance assistant. Given a user's query and supporting document chunks, produce a JSON object with a 'suggestions' list.
-Each suggestion must include:
- - id (integer),
- - text (one-line suggestion),
- - type (Compliance action / Recommendation / Explanation / Escalation),
- - confidence (0-1 numeric),
- - why (one-line justification referencing the chunk id / short quote),
- - sources (list of source identifiers),
- - actionability (High/Medium/Low),
- - next_step (one-line instruction).
+# -------------------------
+# Memory Store (per-session)
+# -------------------------
+SESSION_STORE: Dict[str, InMemoryChatMessageHistory] = {}
 
-Output only valid JSON. If you cannot answer, return {"suggestions": []}.
-""").strip()
+def get_history(session_id: str) -> InMemoryChatMessageHistory:
+    if session_id not in SESSION_STORE:
+        SESSION_STORE[session_id] = InMemoryChatMessageHistory()
+    return SESSION_STORE[session_id]
 
-USER_PROMPT_TEMPLATE = textwrap.dedent("""
-User question:
-{query}
 
-Supporting document chunks (only use these to justify your suggestions). If you need to refer to specific text, quote at most one short excerpt per suggestion and include the chunk number.
-
-Chunks:
-{context}
-
-Produce up to 5 suggestions in the JSON schema described by system prompt. Keep text concise.
-""").strip()
-
-def call_groq_chat(system_prompt: str, user_prompt: str, model=GROQ_MODEL, temperature=0.0, max_tokens=800):
+# -------------------------
+# Build RAG chain (retriever injected)
+# -------------------------
+def build_rag_chain(retriever):
     """
-    Calls the Groq OpenAI-compatible chat completions endpoint.
-    Returns raw assistant text.
+    Builds a history-aware RAG chain using the provided retriever.
     """
-    headers = {
-        "Authorization": f"Bearer {GROQ_API_KEY}",
-        "Content-Type": "application/json",
-    }
 
-    payload = {
-        "model": model,
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
-        ],
-        "temperature": temperature,
-        "max_tokens": max_tokens,
-        "n": 1,
-    }
+    rewrite_chain = rewrite_prompt | llm | StrOutputParser()
 
-    resp = requests.post(GROQ_API_URL, headers=headers, json=payload, timeout=60)
-    resp.raise_for_status()
-    data = resp.json()
+    def retrieval_fn(inputs):
+        query = inputs["query"]
+        docs = retriever.invoke(query)
+        return {
+            "context": format_docs(docs),
+            "question": query,
+        }
+
+    qa_chain = (
+        RunnableMap(
+            {
+                "query": lambda x: x["query"],
+                "retrieval": RunnableLambda(retrieval_fn),
+            }
+        )
+        | RunnableLambda(
+            lambda x: {
+                "context": x["retrieval"]["context"],
+                "question": x["retrieval"]["question"],
+            }
+        )
+        | qa_prompt
+        | llm
+        | StrOutputParser()
+    )
+
+    def rewrite(input_dict):
+        rewritten = rewrite_chain.invoke({"input": input_dict["query"]})
+        return {"query": rewritten}
+
+    base_chain = RunnableLambda(rewrite) | qa_chain
+
+    return RunnableWithMessageHistory(
+        base_chain,
+        get_session_history=get_history,
+        input_messages_key="query",
+        history_messages_key="history",
+    )
 
 
-    choices = data.get("choices") or []
-    if len(choices) == 0:
-        raise ValueError("No choices returned from Groq")
+# -------------------------
+# Public API (USED BY app.py)
+# -------------------------
+def ask_with_history(query: str, retriever, session_id: str = "default") -> str:
+    rag_chain = build_rag_chain(retriever)
+    return rag_chain.invoke(
+        {"query": query},
+        config={"configurable": {"session_id": session_id}},
+    )
 
-   
-    first = choices[0]
-    text = ""
-    if "message" in first and isinstance(first["message"], dict):
-        text = first["message"].get("content", "")
-    else:
-   
-        text = first.get("text") or first.get("delta", {}).get("content", "")
 
-    return text
-
-def ask(query: str):
-
-    docs = retriever.invoke(query)
-
-    print(f"[retrieval] got {len(docs)} chunks")
-
-    
-    context, sources = build_context(docs)
-
-    
-    user_prompt = USER_PROMPT_TEMPLATE.format(query=query, context=context)
-
-   
-    raw = call_groq_chat(SYSTEM_PROMPT, user_prompt)
-    print("[raw response]\n", raw)
-
-  
-    parsed = None
-    try:
-      
-        start = raw.find("{")
-        if start != -1:
-            candidate = raw[start:]
-            parsed = json.loads(candidate)
-        else:
-            parsed = json.loads(raw)
-    except Exception as e:
-        print("Warning: failed to parse JSON directly:", str(e))
-      
-        return {"raw": raw, "suggestions": []}
-
-    return parsed
-
+# -------------------------
+# CLI (optional)
+# -------------------------
 if __name__ == "__main__":
-    print("Interactive RAG query. Type your question and press enter. Ctrl+C to exit.")
+    print("Multi-turn RAG CLI (session-only) — Ctrl+C to exit")
+    sess = "cli"
+
     while True:
         try:
-            q = input("\nQuestion> ").strip()
+            q = input("You: ").strip()
             if not q:
                 continue
-            out = ask(q)
-           
-            print("\n=== Parsed Suggestions ===")
-            print(json.dumps(out, indent=2, ensure_ascii=False))
+            print("⚠️ CLI mode requires retriever from app.py")
         except KeyboardInterrupt:
-            print("\nExiting.")
             break
-        except Exception as ex:
-            print("Error:", ex)
-            break
+
